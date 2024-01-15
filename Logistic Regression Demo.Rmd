@@ -1,0 +1,424 @@
+---
+title: "Logistic Regression Demonstration"
+author: "James King"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_knit$set(root.dir = "C:/Users/james/OneDrive/Documents/School/Past Courses/ST 595/Three Projects/Project 3")
+library(tidyverse)
+library(ggdist)
+library(MASS)
+library(ggcorrplot)
+library(car)
+library(caret)
+library(faraway)
+library(jtools)
+library(lmtest)
+library(ResourceSelection)
+```
+
+# Dataset Exploration
+
+The dataset I am using for analysis is a 1994 dataset from the Census Bureau's American Community Survey (ACS). The data contain information on 15 socioeconomic indicators and are abbreviated and simplified from the raw data. The training and test sets are already split with information on 32,561 individuals in the training set and 16,281 individuals in the test set.
+
+```{r}
+# Read in census data
+c_train <- read_csv("adult.csv")
+c_test <- read_csv("adult.test.csv")
+```
+
+```{r}
+# Convert character columns to factor type
+c_train <- c_train %>% 
+  mutate(
+    age = as.factor(age),
+    workclass = as.factor(workclass),
+    education = as.factor(education),
+    education_yrs = as.factor(education_yrs),
+    marital_status = as.factor(marital_status), 
+    occupation = as.factor(occupation), 
+    relationship = as.factor(relationship), 
+    race = as.factor(race), 
+    sex = as.factor(sex), 
+    native_country = as.factor(native_country),
+    income = as.factor(income)
+  )
+
+glimpse(c_train)
+
+c_test <- c_test %>% 
+  mutate(
+    age = as.factor(age),
+    workclass = as.factor(workclass),
+    education = as.factor(education),
+    education_yrs = as.factor(education_yrs),
+    marital_status = as.factor(marital_status), 
+    occupation = as.factor(occupation), 
+    relationship = as.factor(relationship), 
+    race = as.factor(race), 
+    sex = as.factor(sex), 
+    native_country = as.factor(native_country),
+    income = as.factor(income)
+  )
+
+glimpse(c_test)
+```
+
+The data types appear to be appropriate for all the variables.
+
+```{r}
+# Check for NA values
+c_train %>%
+  summarise_all(~sum(is.na(.)))
+
+c_test %>%
+  summarise_all(~sum(is.na(.)))
+```
+
+There are no NA values to control for. If there were NA values, I would likely omit them since the dataset is large enough to do so without losing value.
+
+```{r}
+# Plot response variable distribution
+ggplot(c_train, aes(x = income, fill = income)) +
+  geom_bar(alpha = 0.75) +
+  labs(title = "Income Distribution", x = "Income Category", y = "Count") +
+  theme_minimal()
+```
+
+The data are imbalanced, however the sampling was representative of the population, so this should not be a problem. Also to note, "<=50K" is the first and most common level, which is what we want for modeling.
+Two ways to manage imbalanced data might be: down sampling or adjusting the decision threshold in the logistic regression model if deemed necessary.
+
+```{r, warning=FALSE}
+# Examine data
+# Specify categorical columns
+cat_columns <- list(
+  c("occupation", "relationship", "race", "sex"),
+  c("native_country", "age", "workclass", "education"),
+  c("education_yrs", "marital_status")
+)
+
+# Function to create histograms
+create_histograms <- function(cat_data, title) {
+  cat_long <- gather(c_train, key = "variable", value = "value", cat_data)
+
+  ggplot(cat_long, aes(x = value, fill = variable)) +
+    geom_histogram(position = "identity", stat = "count") +
+    facet_wrap(~variable, scales = "free") +
+    labs(title = title) +
+    theme_minimal() + 
+    scale_x_discrete(guide = guide_axis(angle = 45)) +
+    guides(fill = FALSE)
+}
+
+# Create histograms for each set of categorical columns
+for (i in seq_along(cat_columns)) {
+  title <- paste("Histograms for Categorical Variables (", i, " of 3)", sep = "")
+  plot_output <- create_histograms(cat_columns[[i]], title)
+  print(plot_output)
+}
+```
+
+Age values are mostly concentrated within the working range, so I won't omit young or old subjects.
+summary(c_train$age)
+Min.    1st Qu. Median  Mean    3rd Qu. Max. 
+17.00   28.00   37.00   38.77   48.00   90.00
+
+`native_country` is highly skewed, `race` is skewed, however the rest of the variables seem okay. I will keep this in mind in case I see a need to manage the skewness by examining the residuals plots during model diagnostics.
+
+```{r, message=FALSE}
+# Examine the independent variables
+cont_columns <- c("fnlwgt", "capital_gain", "capital_loss", "hours_per_week")
+
+# Reshape the data to long format using tidyr
+cont_long <- gather(c_train, key = "variable", value = "value", cont_columns)
+
+# Create histograms for each variable using facet_wrap
+ggplot(cont_long, aes(x = value, fill = variable)) +
+  geom_histogram(position = "identity") +
+  facet_wrap(~variable, scales = "free") +
+  labs(title = "Histograms for Continuous Variables") +
+  theme_minimal() + 
+  guides(fill = FALSE)
+```
+
+Once again, I see some skewness to keep in mind. However, I won't do data transformations unless I see a case for it in the residuals plots.
+
+
+
+# Fit a Logistic Regression Model
+
+Now, I would like to explore how factors outside our control may influence our salary. In these data, the variables I see that would fall under this category are `age`, `race`, `sex`, `native_country`.
+
+Null hypothesis: All coefficients in the equation take the value zero.
+
+Alternative hypothesis: The model with the predictors under consideration is accurate and differs significantly from the null.
+
+```{r}
+# Summarize counts by race category
+c_train %>% 
+  group_by(race) %>% 
+  summarise(count = n()) %>% 
+  arrange(count = n())
+
+# Re-level `race` based on populations
+c_train$race <- factor(c_train$race, levels = c("White", 
+                                                "Black", 
+                                                "Asian-Pac-Islander", 
+                                                "Amer-Indian-Eskimo", 
+                                                "Other"))
+```
+
+First, re-level the `race` category based on counts, setting the most prevalent group as the reference for model building.
+
+```{r}
+# Fit the null model
+null_mod <- glm(income ~ 1,
+                data = c_train, 
+              family = binomial)
+
+# Fit the alternative model
+alt_mod <- glm(income ~ age + race + sex + native_country, 
+              data = c_train, 
+              family = binomial)
+
+summary(alt_mod)
+```
+
+Age does not appear to be a significant predictor in the summary output, so let's test if we should remove it (due to the principle of parsimony) with a Likelihood-Ratio Test (LRT).
+
+```{r}
+# Fit model without age
+alt_mod2 <- glm(income ~ race + sex + native_country, 
+              data = c_train, 
+              family = binomial)
+
+# Perform (LRT)
+lrtest(alt_mod, alt_mod2)
+```
+
+The small p-value suggests the inclusion of `age` improves the model fit. Therefore we will keep `age` in the model for the analysis.
+
+
+
+# Model Fit and Diagnostics
+
+The logistic regression assumptions we need to check are:
+* Dependent variable must be binary (or ordinal). This assumption is met.
+* Observations must be independent of each other. This assumption is met in the Census sampling design.
+* Must be little to no multicollinearity among independent variables (VIF test). This assumption is not met. See below for more information. 
+* Linearity of independent variables and log odds (residuals plots). This assumption is partially met. See below for more information.
+* Large sample size. This assumption is met.
+
+```{r}
+# Check multicollinearity assumption
+# VIF < 5 required to state no multicollinearity
+vif(alt_mod)
+```
+
+We can see `race` and `native_country` showing many instances of greater than 5 for the variance inflation factor, so our model as-is violates the multicollinearity assumption. Two ways I could try to address this are adding a `race:native_country` interaction term, or removing `native_country` altogether. I'm not going to do this however, because this model is intended to gain insights rather than make accurate predictions.
+
+```{r, warning=FALSE}
+# If there are NA's in the model coefficient estimates, I could use correlation as a proxy for VIF:
+
+# Create a correlation plot for all variables
+# For factor variables, model.matrix codes non-numeric variables
+# (cor_plot <- model.matrix(~ race + sex + native_country + race:native_country,
+#                           data = c_train[, c(9, 10, 14)]) %>%
+#    cor(use = "pairwise.complete.obs") %>%
+#    ggcorrplot(type = "upper" ,lab = TRUE))
+
+# Filter for correlations greater than 0.9
+# (correlated_vars <- filter(cor_plot$data, value > 0.9))
+```
+
+```{r, warning=FALSE}
+# Check for linearity between each predictor and the log odds of the response
+residualPlots(alt_mod)
+```
+
+We are seeing data points not entirely centered around zero with the model. I am not fully confident in linearity of the relationship between each predictor and the log-odds of the response variable. Since all our variables are categorical (age is typically used as a categorical variable in regression modeling), I can't do data transformations, so I will accept what I'm seeing.
+
+I see some outlier data points as well. Let's look further into the outliers with an outlier test:
+
+```{r}
+# Perform outlier test
+outlierTest(alt_mod)
+```
+
+Based on a small p-value, let's continue exploration of outliers.
+
+We need to look at summary statistics for: 
+* Studentized residuals to view outliers
+* Hat values to view data with high leverage
+* Cook’s distance to view data with high influence
+
+```{r, warning=FALSE}
+# Studentized residuals
+sr <- studres(alt_mod)
+
+# Create a data frame
+resid_df <- data.frame(index = seq_along(sr), stdresiduals = sr)
+
+# Plot
+ggplot(resid_df, aes(x = index, y = stdresiduals)) +
+  geom_point(col = "salmon2") + 
+  labs(title = "Studentized Residuals Plot (for outliers)") + 
+  labs(x = "Index", y = "Studentized Residuals") + 
+  theme_minimal()
+```
+
+There appear to be five strong outlier data points, and a good number of less strong outliers based on the studentized residuals.
+
+```{r}
+# Hat values
+hat <- hatvalues(alt_mod)
+
+# Create a ggplot for hat values plot
+ggplot(data.frame(index = seq_along(hat), hat_values = hat), 
+       aes(x = index, y = hat_values)) +
+  geom_point(col = "salmon2") +
+  labs(title = "Hat Values Plot (for points with leverage)",
+       x = "Index", y = "Hat Values") +
+  theme_minimal()
+```
+
+There appear to be many data points with leverage, two of which are ~1.
+
+```{r, warning=FALSE}
+# Cook's distance
+cooks_dist <- cooks.distance(alt_mod)
+
+# ggplot for Cook's distance plot
+ggplot(data.frame(index = seq_along(cooks_dist), cooks_distance = cooks_dist), 
+       aes(x = index, y = cooks_distance)) +
+  geom_point(col = "salmon2") +
+  labs(title = "Cook's Distance Plot (for influential points)") +
+  labs(x = "Index", y = "Cook's Distance") + 
+  theme_minimal()
+```
+
+There appear to be even more data points that are influential to the model.
+
+```{r}
+# Overall influence plot
+influencePlot(alt_mod, 
+              col = "salmon2", 
+              fill.col = "salmon2",
+              fill.alpha = 0.5)
+```
+
+This overall influence plot identifies unusual observations by plotting studentized residuals against hat-values, with the size of circle is proportional to Cook’s distance. There are six data points I would need to remove had this model been intended for prediction. For the purpose of data analysis, I am going to consider this dataset representative of the population and I will not exclude any of these data points since it is a Census dataset.
+
+```{r}
+# Test model fit
+hoslem.test(alt_mod$y, fitted(alt_mod))
+
+# big p-value means no significant difference between observed and predicted 
+#   values which would be a "good model fit"
+```
+
+Finally, I can test the model fit. With a p-value of < 0.05, I can say there is a significant difference between observed and predicted values which means we may not have a "good model fit".
+
+# Interpret the Model
+
+```{r}
+# Perform a Likelihood Ratio Test to test our hypothesis
+lrtest(null_mod, alt_mod)
+```
+
+Returning to our hypothesis, we have evidence to reject the null and suggest age, race, sex, and native country are significant contributors to whether salary is <= or > $50k annually based on a p-value of essentially zero using a Likelihood Ratio test.
+
+Now that we have gained some insight, let's discuss the effect size (for logistic regression this is the odds ratio) of the `race` predictor variable.
+
+```{r}
+# Calculate multiplicative difference for Black racial group
+exp(-0.7808)                              # Point estimate
+exp(-0.7808 + c(-1, 1) * 1.96 * 0.06028)  # 95% C.I.
+# 0.4580394
+# 0.4069973, 0.5154829
+
+# Calculate multiplicative difference for Asian-Pac-Islander racial group
+exp(-0.03096)
+exp(-0.03096 + c(-1, 1) * 1.96 * 0.1250)
+# 0.9695144
+# 0.7588433, 1.2386722
+
+# Calculate multiplicative difference for Amer-Indian-Eskimo
+exp(-0.9715)
+exp(-0.9715 + c(-1, 1) * 1.96 * 0.1857)
+# 0.3785148
+# 0.2630340, 0.5446957
+
+# Calculate multiplicative difference for Other
+exp(-0.6154)
+exp(-0.6154 + c(-1, 1) * 1.96 * 0.2299)
+# 0.5404247
+# 0.3443819, 0.8480667
+```
+
+Coefficient interpretations:
+The Other racial group’s odds of making more than $50k annually are exp(-0.6154) = 0.54x that of the White racial group. The 95% CI for the multiplicative difference (change in odds ratio) are exp(-0.6154 + c(-1, 1) * 1.96 * 0.2299) = [0.34, 0.85].
+
+General logistic regression formula:
+\[
+\text{logit}(p(x)) = \beta_0 + \beta_1 x_1 + \beta_2 x_2 + \ldots + \beta_p x_p
+\]
+
+where:
+- \(p(x)\) is the probability of the event occurring.
+- \(\beta_0\) is the intercept.
+- \(\beta_1, \beta_2, \ldots, \beta_p\) are the coefficients for the predictor variables \(x_1, x_2, \ldots, x_p\).
+
+Probability that a male whose native country is the United States and is from the Other racial group makes > 50k is:
+\[
+P(Salary >50k) = exp(-1.93942 + 1.151*1 + 0.05483*1 - 0.6154*1) = 0.26
+\]
+
+```{r}
+# Visualize odds of income by race
+effect_plot(alt_mod, pred = race, plot.points = TRUE,
+            main.title = "Relative Probability of Earning > $50k",
+            x.label = "Racial Group",
+            y.label = "Probability") +
+  coord_flip()
+```
+
+
+
+# Make Predictions
+
+Making predictions to assess the model's accuracy, we see the overall accuracy rate is ~65%. The sensitivity (true positive rate) of the model is not great. The specificity (lack of false positive) is better.
+
+```{r, warning=FALSE}
+# Filter out subjects who are 89 due to error:
+c_test <- c_test %>% 
+  filter(age != 89)
+
+# Make predictions
+predictions <- predict(alt_mod, newdata = c_test, type = "response")
+predictions <- ifelse(predictions < 0.265, "<=50K", ">50K")
+
+# Evaluate accuracy
+caret::confusionMatrix(as.factor(predictions), c_test$income)
+```
+
+
+
+# Conclusion
+
+Rather than being a great predictive model, our model serves to give us some insights into how factors we cannot control play into what our salary may be.
+
+
+
+\pagebreak
+# Appendix
+
+```{r, ref.label=knitr::all_labels(), echo=TRUE, eval=FALSE}
+
+```
+
